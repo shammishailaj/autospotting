@@ -1,9 +1,15 @@
+// Copyright (c) 2016-2019 Cristian Măgherușan-Stanciu
+// Licensed under the Open Software License version 3.0
+
 package autospotting
 
 import (
+	"encoding/base64"
 	"errors"
+	"io/ioutil"
 	"math"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -236,6 +242,7 @@ func TestIsSpot(t *testing.T) {
 		})
 	}
 }
+
 func TestIsEBSCompatible(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -245,44 +252,55 @@ func TestIsEBSCompatible(t *testing.T) {
 	}{
 		{name: "EBS not Optimized Spot not Optimized",
 			spotInfo: instanceTypeInformation{
-				hasEBSOptimization: false,
+				EBSThroughput: 0,
 			},
 			instanceInfo: instance{
-				Instance: &ec2.Instance{
-					EbsOptimized: nil,
+				typeInfo: instanceTypeInformation{
+					EBSThroughput: 0,
 				},
 			},
 			expected: true,
 		},
-		{name: "EBS Optimized Spot Optimized",
+		{name: "EBS Optimized Spot Optimized with same throughput",
 			spotInfo: instanceTypeInformation{
-				hasEBSOptimization: true,
+				EBSThroughput: 100,
 			},
 			instanceInfo: instance{
-				Instance: &ec2.Instance{
-					EbsOptimized: &[]bool{true}[0],
+				typeInfo: instanceTypeInformation{
+					EBSThroughput: 100,
+				},
+			},
+			expected: true,
+		},
+		{name: "EBS Optimized Spot Optimized with more throughput",
+			spotInfo: instanceTypeInformation{
+				EBSThroughput: 200,
+			},
+			instanceInfo: instance{
+				typeInfo: instanceTypeInformation{
+					EBSThroughput: 100,
 				},
 			},
 			expected: true,
 		},
 		{name: "EBS Optimized Spot not Optimized",
 			spotInfo: instanceTypeInformation{
-				hasEBSOptimization: false,
+				EBSThroughput: 0,
 			},
 			instanceInfo: instance{
-				Instance: &ec2.Instance{
-					EbsOptimized: &[]bool{true}[0],
+				typeInfo: instanceTypeInformation{
+					EBSThroughput: 100,
 				},
 			},
 			expected: false,
 		},
 		{name: "EBS not Optimized Spot Optimized",
 			spotInfo: instanceTypeInformation{
-				hasEBSOptimization: true,
+				EBSThroughput: 100,
 			},
 			instanceInfo: instance{
-				Instance: &ec2.Instance{
-					EbsOptimized: &[]bool{false}[0],
+				typeInfo: instanceTypeInformation{
+					EBSThroughput: 0,
 				},
 			},
 			expected: true,
@@ -321,32 +339,6 @@ func TestIsPriceCompatible(t *testing.T) {
 			instancePrice:    5.0,
 			bestPrice:        0.7,
 			expected:         false,
-		},
-		{name: "Spot price is higher than bestPrice",
-			spotPrices: prices{
-				spot: map[string]float64{
-					"eu-central-1": 0.5,
-					"eu-west-1":    1.0,
-					"eu-west-2":    2.0,
-				},
-			},
-			availabilityZone: aws.String("eu-west-1"),
-			instancePrice:    5.0,
-			bestPrice:        0.7,
-			expected:         false,
-		},
-		{name: "Spot price is lower than bestPrice",
-			spotPrices: prices{
-				spot: map[string]float64{
-					"eu-central-1": 0.5,
-					"eu-west-1":    1.0,
-					"eu-west-2":    2.0,
-				},
-			},
-			availabilityZone: aws.String("eu-west-1"),
-			instancePrice:    5.0,
-			bestPrice:        1.4,
-			expected:         true,
 		},
 		{name: "Spot price is 0.0",
 			spotPrices: prices{
@@ -387,7 +379,7 @@ func TestIsPriceCompatible(t *testing.T) {
 			candidate := instanceTypeInformation{pricing: prices{}}
 			candidate.pricing = tt.spotPrices
 			spotPrice := i.calculatePrice(candidate)
-			retValue := i.isPriceCompatible(spotPrice, tt.bestPrice)
+			retValue := i.isPriceCompatible(spotPrice)
 			if retValue != tt.expected {
 				t.Errorf("Value received: %t expected %t", retValue, tt.expected)
 			}
@@ -406,8 +398,9 @@ func TestIsClassCompatible(t *testing.T) {
 	}{
 		{name: "Spot is higher in both CPU & memory",
 			spotInfo: instanceTypeInformation{
-				vCPU:   10,
-				memory: 2.5,
+				vCPU:              10,
+				memory:            2.5,
+				PhysicalProcessor: "Intel",
 			},
 			instanceCPU:    5,
 			instanceMemory: 1.0,
@@ -415,8 +408,9 @@ func TestIsClassCompatible(t *testing.T) {
 		},
 		{name: "Spot is lower in CPU but higher in memory",
 			spotInfo: instanceTypeInformation{
-				vCPU:   10,
-				memory: 2.5,
+				vCPU:              10,
+				memory:            2.5,
+				PhysicalProcessor: "Intel",
 			},
 			instanceCPU:    15,
 			instanceMemory: 1.0,
@@ -424,8 +418,9 @@ func TestIsClassCompatible(t *testing.T) {
 		},
 		{name: "Spot is lower in memory but higher in CPU",
 			spotInfo: instanceTypeInformation{
-				vCPU:   10,
-				memory: 2.5,
+				vCPU:              10,
+				memory:            2.5,
+				PhysicalProcessor: "Intel",
 			},
 			instanceCPU:    5,
 			instanceMemory: 10.0,
@@ -433,8 +428,9 @@ func TestIsClassCompatible(t *testing.T) {
 		},
 		{name: "Spot is lower in both CPU & memory",
 			spotInfo: instanceTypeInformation{
-				vCPU:   10,
-				memory: 2.5,
+				vCPU:              10,
+				memory:            2.5,
+				PhysicalProcessor: "Intel",
 			},
 			instanceCPU:    15,
 			instanceMemory: 5.0,
@@ -442,9 +438,10 @@ func TestIsClassCompatible(t *testing.T) {
 		},
 		{name: "Spot is lower in CPU, memory and GPU ",
 			spotInfo: instanceTypeInformation{
-				vCPU:   10,
-				memory: 2.5,
-				GPU:    0,
+				vCPU:              10,
+				memory:            2.5,
+				GPU:               0,
+				PhysicalProcessor: "Intel",
 			},
 			instanceCPU:    15,
 			instanceMemory: 5.0,
@@ -454,9 +451,10 @@ func TestIsClassCompatible(t *testing.T) {
 
 		{name: "Spot is higher in CPU, memory and GPU ",
 			spotInfo: instanceTypeInformation{
-				vCPU:   10,
-				memory: 20,
-				GPU:    4,
+				vCPU:              10,
+				memory:            20,
+				GPU:               4,
+				PhysicalProcessor: "Intel",
 			},
 			instanceCPU:    8,
 			instanceMemory: 4,
@@ -468,8 +466,9 @@ func TestIsClassCompatible(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			i := &instance{typeInfo: instanceTypeInformation{
-				vCPU:   tt.instanceCPU,
-				memory: tt.instanceMemory,
+				vCPU:              tt.instanceCPU,
+				memory:            tt.instanceMemory,
+				PhysicalProcessor: "Intel",
 			},
 			}
 			retValue := i.isClassCompatible(tt.spotInfo)
@@ -643,6 +642,7 @@ func TestIsVirtualizationCompatible(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			i := &instance{Instance: &ec2.Instance{
 				VirtualizationType: tt.instanceVirtualizationType,
+				InstanceType:       aws.String("dummy"),
 			}}
 			retValue := i.isVirtualizationCompatible(tt.spotVirtualizationTypes)
 			if retValue != tt.expected {
@@ -654,19 +654,19 @@ func TestIsVirtualizationCompatible(t *testing.T) {
 
 func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 	tests := []struct {
-		name           string
-		spotInfos      map[string]instanceTypeInformation
-		instanceInfo   *instance
-		asg            *autoScalingGroup
-		expectedString string
-		expectedError  error
-		allowedList    []string
-		disallowedList []string
+		name                  string
+		spotInfos             map[string]instanceTypeInformation
+		instanceInfo          *instance
+		asg                   *autoScalingGroup
+		expectedCandidateList []string
+		expectedError         error
+		allowedList           []string
+		disallowedList        []string
 	}{
 		{name: "better/cheaper spot instance found",
 			spotInfos: map[string]instanceTypeInformation{
 				"1": {
-					instanceType: "type1",
+					instanceType: "type1", // cheapest, cheaper than ondemand
 					pricing: prices{
 						spot: map[string]float64{
 							"eu-central-1": 0.5,
@@ -675,6 +675,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 						},
 					},
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -682,7 +683,24 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 					virtualizationTypes:      []string{"PV", "else"},
 				},
 				"2": {
-					instanceType: "type2",
+					instanceType: "type2", // less cheap, but cheaper than ondemand
+					pricing: prices{
+						spot: map[string]float64{
+							"eu-central-1": 0.7,
+							"eu-west-1":    1.0,
+							"eu-west-2":    2.0,
+						},
+					},
+					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
+					memory:                   2.5,
+					instanceStoreDeviceCount: 1,
+					instanceStoreDeviceSize:  50.0,
+					instanceStoreIsSSD:       false,
+					virtualizationTypes:      []string{"PV", "else"},
+				},
+				"3": {
+					instanceType: "type3", // more expensive than ondemand
 					pricing: prices{
 						spot: map[string]float64{
 							"eu-central-1": 0.8,
@@ -691,6 +709,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 						},
 					},
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -707,6 +726,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 				},
 				typeInfo: instanceTypeInformation{
 					instanceType:             "typeX",
+					PhysicalProcessor:        "Intel",
 					vCPU:                     10,
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
@@ -734,8 +754,8 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 					DesiredCapacity: aws.Int64(4),
 				},
 			},
-			expectedString: "type1",
-			expectedError:  nil,
+			expectedCandidateList: []string{"type1", "type2"},
+			expectedError:         nil,
 		},
 		{name: "better/cheaper spot instance found but marked as disallowed",
 			spotInfos: map[string]instanceTypeInformation{
@@ -749,6 +769,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 						},
 					},
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -765,6 +786,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 						},
 					},
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -782,6 +804,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 				typeInfo: instanceTypeInformation{
 					instanceType:             "typeX",
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -795,6 +818,9 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 				instances: makeInstancesWithCatalog(
 					instanceMap{
 						"id-1": {
+							typeInfo: instanceTypeInformation{
+								PhysicalProcessor: "Intel",
+							},
 							Instance: &ec2.Instance{
 								InstanceId:        aws.String("id-1"),
 								InstanceType:      aws.String("typeX"),
@@ -808,9 +834,9 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 					DesiredCapacity: aws.Int64(4),
 				},
 			},
-			disallowedList: []string{"type*"},
-			expectedString: "",
-			expectedError:  errors.New("No cheaper spot instance types could be found"),
+			disallowedList:        []string{"type*"},
+			expectedCandidateList: nil,
+			expectedError:         errors.New("No cheaper spot instance types could be found"),
 		},
 		{name: "better/cheaper spot instance found but not marked as allowed",
 			spotInfos: map[string]instanceTypeInformation{
@@ -824,6 +850,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 						},
 					},
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -840,6 +867,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 						},
 					},
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -856,6 +884,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 				},
 				typeInfo: instanceTypeInformation{
 					instanceType:             "typeX",
+					PhysicalProcessor:        "Intel",
 					vCPU:                     10,
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
@@ -883,9 +912,9 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 					DesiredCapacity: aws.Int64(4),
 				},
 			},
-			allowedList:    []string{"asdf*"},
-			expectedString: "",
-			expectedError:  errors.New("No cheaper spot instance types could be found"),
+			allowedList:           []string{"asdf*"},
+			expectedCandidateList: nil,
+			expectedError:         errors.New("No cheaper spot instance types could be found"),
 		},
 		{name: "better/cheaper spot instance found and marked as allowed",
 			spotInfos: map[string]instanceTypeInformation{
@@ -899,6 +928,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 						},
 					},
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -915,6 +945,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 						},
 					},
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -932,6 +963,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 				typeInfo: instanceTypeInformation{
 					instanceType:             "typeX",
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -959,9 +991,9 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 				},
 			},
 
-			allowedList:    []string{"ty*"},
-			expectedString: "type1",
-			expectedError:  nil,
+			allowedList:           []string{"ty*"},
+			expectedCandidateList: []string{"type1"},
+			expectedError:         nil,
 		},
 		{name: "better/cheaper spot instance not found",
 			spotInfos: map[string]instanceTypeInformation{
@@ -975,6 +1007,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 						},
 					},
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -991,6 +1024,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 						},
 					},
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -1008,6 +1042,7 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 				typeInfo: instanceTypeInformation{
 					instanceType:             "typeX",
 					vCPU:                     10,
+					PhysicalProcessor:        "Intel",
 					memory:                   2.5,
 					instanceStoreDeviceCount: 1,
 					instanceStoreDeviceSize:  50.0,
@@ -1034,8 +1069,8 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 					DesiredCapacity: aws.Int64(4),
 				},
 			},
-			expectedString: "",
-			expectedError:  errors.New("No cheaper spot instance types could be found"),
+			expectedCandidateList: nil,
+			expectedError:         errors.New("No cheaper spot instance types could be found"),
 		},
 	}
 
@@ -1046,15 +1081,19 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 			i.asg = tt.asg
 			allowedList := tt.allowedList
 			disallowedList := tt.disallowedList
-			retValue, err := i.getCheapestCompatibleSpotInstanceType(allowedList, disallowedList)
+			retValue, err := i.getCompatibleSpotInstanceTypesListSortedAscendingByPrice(allowedList, disallowedList)
+			var retInstTypes []string
+			for _, retval := range retValue {
+				retInstTypes = append(retInstTypes, retval.instanceType)
+			}
 			if err == nil && tt.expectedError != err {
-				t.Errorf("Error received: %v expected %v", err, tt.expectedError.Error())
+				t.Errorf("1 Error received: %v expected %v", err, tt.expectedError.Error())
 			} else if err != nil && tt.expectedError == nil {
-				t.Errorf("Error received: %s expected %s", err.Error(), tt.expectedError)
+				t.Errorf("2 Error received: %s expected %s", err.Error(), tt.expectedError)
 			} else if err != nil && tt.expectedError != nil && err.Error() != tt.expectedError.Error() {
-				t.Errorf("Error received: %s expected %s", err.Error(), tt.expectedError.Error())
-			} else if retValue.instanceType != tt.expectedString {
-				t.Errorf("Value received: %s expected %s", retValue.instanceType, tt.expectedString)
+				t.Errorf("3 Error received: %s expected %s", err.Error(), tt.expectedError.Error())
+			} else if !reflect.DeepEqual(retInstTypes, tt.expectedCandidateList) {
+				t.Errorf("4 Value received: %s expected %s", retInstTypes, tt.expectedCandidateList)
 			}
 		})
 	}
@@ -1065,6 +1104,7 @@ func TestGetPricetoBid(t *testing.T) {
 		spotPercentage       float64
 		currentSpotPrice     float64
 		currentOnDemandPrice float64
+		spotPremium          float64
 		policy               string
 		want                 float64
 	}{
@@ -1072,6 +1112,7 @@ func TestGetPricetoBid(t *testing.T) {
 			spotPercentage:       50.0,
 			currentSpotPrice:     0.0216,
 			currentOnDemandPrice: 0.0464,
+			spotPremium:          0.0,
 			policy:               "aggressive",
 			want:                 0.0324,
 		},
@@ -1079,6 +1120,7 @@ func TestGetPricetoBid(t *testing.T) {
 			spotPercentage:       79.0,
 			currentSpotPrice:     0.0216,
 			currentOnDemandPrice: 0.0464,
+			spotPremium:          0.0,
 			policy:               "aggressive",
 			want:                 0.038664,
 		},
@@ -1086,6 +1128,7 @@ func TestGetPricetoBid(t *testing.T) {
 			spotPercentage:       79.0,
 			currentSpotPrice:     0.0216,
 			currentOnDemandPrice: 0.0464,
+			spotPremium:          0.0,
 			policy:               "normal",
 			want:                 0.0464,
 		},
@@ -1093,25 +1136,47 @@ func TestGetPricetoBid(t *testing.T) {
 			spotPercentage:       200.0,
 			currentSpotPrice:     0.0216,
 			currentOnDemandPrice: 0.0464,
+			spotPremium:          0.0,
 			policy:               "aggressive",
 			want:                 0.0464,
+		},
+		{
+			spotPercentage:       0.0,
+			currentSpotPrice:     0.0216,
+			currentOnDemandPrice: 0.0464,
+			spotPremium:          0.0,
+			policy:               "aggressive",
+			want:                 0.0216,
+		},
+		{
+			spotPercentage:       50.0,
+			currentSpotPrice:     0.0816,
+			currentOnDemandPrice: 0.1064,
+			spotPremium:          0.06,
+			policy:               "aggressive",
+			want:                 0.0924,
 		},
 	}
 	for _, tt := range tests {
 		cfg := &Config{
-			SpotPriceBufferPercentage: tt.spotPercentage,
-			BiddingPolicy:             tt.policy,
-		}
+			AutoScalingConfig: AutoScalingConfig{
+				SpotPriceBufferPercentage: tt.spotPercentage,
+				BiddingPolicy:             tt.policy,
+			}}
 		i := &instance{
 			region: &region{
 				name: "us-east-1",
 				conf: cfg,
 			},
+			Instance: &ec2.Instance{
+				InstanceId: aws.String("i-0000000"),
+			},
 		}
 
 		currentSpotPrice := tt.currentSpotPrice
 		currentOnDemandPrice := tt.currentOnDemandPrice
-		actualPrice := i.getPricetoBid(currentOnDemandPrice, currentSpotPrice)
+		currentSpotPremium := tt.spotPremium
+		actualPrice := i.getPricetoBid(currentOnDemandPrice, currentSpotPrice, currentSpotPremium)
 		if math.Abs(actualPrice-tt.want) > 0.000001 {
 			t.Errorf("percentage = %.2f, policy = %s, expected price = %.5f, want %.5f, currentSpotPrice = %.5f",
 				tt.spotPercentage, tt.policy, actualPrice, tt.want, currentSpotPrice)
@@ -1294,7 +1359,16 @@ func TestGenerateTagList(t *testing.T) {
 			}
 
 			tags := i.generateTagsList()
-			if !reflect.DeepEqual(tags, tt.expectedTagSpecification) {
+
+			// make sure the lists of tags are sorted, otherwise the comparison fails
+			sort.Slice(tags[0].Tags, func(i, j int) bool {
+				return *tags[0].Tags[i].Key < *tags[0].Tags[j].Key
+			})
+			sort.Slice(tt.expectedTagSpecification[0].Tags, func(i, j int) bool {
+				return *tt.expectedTagSpecification[0].Tags[i].Key < *tt.expectedTagSpecification[0].Tags[j].Key
+			})
+
+			if !reflect.DeepEqual(tags[0].Tags, tt.expectedTagSpecification[0].Tags) {
 				t.Errorf("propagatedInstanceTags received: %+v, expected: %+v",
 					tags, tt.expectedTagSpecification)
 			}
@@ -1323,20 +1397,19 @@ func Test_instance_convertBlockDeviceMappings(t *testing.T) {
 			want: []*ec2.BlockDeviceMapping{},
 		},
 		{
-			name: "instance-store only",
+			name: "instance-store only, skipping one of the volumes from the BDMs",
 			lc: &launchConfiguration{
 				LaunchConfiguration: &autoscaling.LaunchConfiguration{
 					BlockDeviceMappings: []*autoscaling.BlockDeviceMapping{
 						{
 							DeviceName:  aws.String("/dev/ephemeral0"),
 							Ebs:         nil,
-							NoDevice:    aws.Bool(false),
+							NoDevice:    aws.Bool(true),
 							VirtualName: aws.String("foo"),
 						},
 						{
 							DeviceName:  aws.String("/dev/ephemeral1"),
 							Ebs:         nil,
-							NoDevice:    aws.Bool(false),
 							VirtualName: aws.String("bar"),
 						},
 					},
@@ -1344,15 +1417,8 @@ func Test_instance_convertBlockDeviceMappings(t *testing.T) {
 			},
 			want: []*ec2.BlockDeviceMapping{
 				{
-					DeviceName:  aws.String("/dev/ephemeral0"),
-					Ebs:         nil,
-					NoDevice:    aws.String("false"),
-					VirtualName: aws.String("foo"),
-				},
-				{
 					DeviceName:  aws.String("/dev/ephemeral1"),
 					Ebs:         nil,
-					NoDevice:    aws.String("false"),
 					VirtualName: aws.String("bar"),
 				},
 			},
@@ -1366,7 +1432,6 @@ func Test_instance_convertBlockDeviceMappings(t *testing.T) {
 						{
 							DeviceName:  aws.String("/dev/ephemeral0"),
 							Ebs:         nil,
-							NoDevice:    aws.Bool(false),
 							VirtualName: aws.String("foo"),
 						},
 						{
@@ -1392,7 +1457,6 @@ func Test_instance_convertBlockDeviceMappings(t *testing.T) {
 				{
 					DeviceName:  aws.String("/dev/ephemeral0"),
 					Ebs:         nil,
-					NoDevice:    aws.String("false"),
 					VirtualName: aws.String("foo"),
 				},
 				{
@@ -1481,6 +1545,15 @@ func Test_instance_convertSecurityGroups(t *testing.T) {
 }
 
 func Test_instance_createRunInstancesInput(t *testing.T) {
+	beanstalkUserDataExample, err := ioutil.ReadFile("../test_data/beanstalk_userdata_example.txt")
+	if err != nil {
+		t.Errorf("Unable to read Beanstalk UserData example")
+	}
+
+	beanstalkUserDataWrappedExample, err := ioutil.ReadFile("../test_data/beanstalk_userdata_wrapped_example.txt")
+	if err != nil {
+		t.Errorf("Unable to read Beanstalk UserData wrapped example")
+	}
 
 	type args struct {
 		instanceType string
@@ -1493,18 +1566,30 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 		want *ec2.RunInstancesInput
 	}{
 		{
-			name: "create run instances input without launch-configuration",
+			name: "create run instances input with basic launch template",
 			inst: instance{
+				region: &region{
+					services: connections{
+						ec2: mockEC2{
+							dltverr: nil,
+							dltvo: &ec2.DescribeLaunchTemplateVersionsOutput{
+								LaunchTemplateVersions: []*ec2.LaunchTemplateVersion{
+									{
+										LaunchTemplateData: &ec2.ResponseLaunchTemplateData{},
+									},
+								},
+							},
+						},
+					},
+				},
 				asg: &autoScalingGroup{
 					name: "mygroup",
 					Group: &autoscaling.Group{
-						LaunchConfigurationName: aws.String("myLC"),
 						LaunchTemplate: &autoscaling.LaunchTemplateSpecification{
-							LaunchTemplateId:   aws.String("lt-id"),
-							LaunchTemplateName: aws.String("lt-name"),
+							LaunchTemplateId: aws.String("lt-id"),
+							Version:          aws.String("v1"),
 						},
 					},
-					launchConfiguration: nil,
 				},
 				Instance: &ec2.Instance{
 					EbsOptimized: aws.Bool(true),
@@ -1513,7 +1598,124 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 						Arn: aws.String("profile-arn"),
 					},
 
-					ImageId:      aws.String("ami-123"),
+					InstanceType: aws.String("t2.medium"),
+
+					Placement: &ec2.Placement{
+						Affinity: aws.String("foo"),
+					},
+
+					SecurityGroups: []*ec2.GroupIdentifier{
+						{
+							GroupName: aws.String("foo"),
+							GroupId:   aws.String("sg-123"),
+						},
+						{
+							GroupName: aws.String("bar"),
+							GroupId:   aws.String("sg-456"),
+						},
+					},
+
+					SubnetId: aws.String("subnet-123"),
+				},
+			}, args: args{
+				instanceType: "t2.small",
+				price:        1.5,
+			},
+			want: &ec2.RunInstancesInput{
+
+				EbsOptimized: aws.Bool(true),
+
+				InstanceMarketOptions: &ec2.InstanceMarketOptionsRequest{
+					MarketType: aws.String("spot"),
+					SpotOptions: &ec2.SpotMarketOptions{
+						MaxPrice: aws.String("1.5"),
+					},
+				},
+
+				InstanceType: aws.String("t2.small"),
+
+				LaunchTemplate: &ec2.LaunchTemplateSpecification{
+					LaunchTemplateId: aws.String("lt-id"),
+					Version:          aws.String("v1"),
+				},
+
+				MaxCount: aws.Int64(1),
+				MinCount: aws.Int64(1),
+
+				Placement: &ec2.Placement{
+					Affinity: aws.String("foo"),
+				},
+
+				SecurityGroupIds: []*string{
+					aws.String("sg-123"),
+					aws.String("sg-456"),
+				},
+
+				SubnetId: aws.String("subnet-123"),
+
+				TagSpecifications: []*ec2.TagSpecification{{
+					ResourceType: aws.String("instance"),
+					Tags: []*ec2.Tag{
+						{
+							Key:   aws.String("LaunchTemplateID"),
+							Value: aws.String("lt-id"),
+						},
+						{
+							Key:   aws.String("LaunchTemplateVersion"),
+							Value: aws.String("v1"),
+						},
+						{
+							Key:   aws.String("launched-by-autospotting"),
+							Value: aws.String("true"),
+						},
+						{
+							Key:   aws.String("launched-for-asg"),
+							Value: aws.String("mygroup"),
+						},
+					},
+				},
+				},
+			},
+		},
+		{
+			name: "create run instances input with launch template containing advanced network configuration",
+			inst: instance{
+				region: &region{
+					services: connections{
+						ec2: mockEC2{
+							dltverr: nil,
+							dltvo: &ec2.DescribeLaunchTemplateVersionsOutput{
+								LaunchTemplateVersions: []*ec2.LaunchTemplateVersion{
+									{
+										LaunchTemplateData: &ec2.ResponseLaunchTemplateData{
+											NetworkInterfaces: []*ec2.LaunchTemplateInstanceNetworkInterfaceSpecification{
+												{
+													Description: aws.String("dummy network interface definition"),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				asg: &autoScalingGroup{
+					name: "mygroup",
+					Group: &autoscaling.Group{
+						LaunchTemplate: &autoscaling.LaunchTemplateSpecification{
+							LaunchTemplateId: aws.String("lt-id"),
+							Version:          aws.String("v1"),
+						},
+					},
+				},
+				Instance: &ec2.Instance{
+					EbsOptimized: aws.Bool(true),
+
+					IamInstanceProfile: &ec2.IamInstanceProfile{
+						Arn: aws.String("profile-arn"),
+					},
+
 					InstanceType: aws.String("t2.medium"),
 					KeyName:      aws.String("mykey"),
 
@@ -1542,12 +1744,6 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 
 				EbsOptimized: aws.Bool(true),
 
-				IamInstanceProfile: &ec2.IamInstanceProfileSpecification{
-					Arn: aws.String("profile-arn"),
-				},
-
-				ImageId: aws.String("ami-123"),
-
 				InstanceMarketOptions: &ec2.InstanceMarketOptionsRequest{
 					MarketType: aws.String("spot"),
 					SpotOptions: &ec2.SpotMarketOptions{
@@ -1556,33 +1752,36 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 				},
 
 				InstanceType: aws.String("t2.small"),
-				KeyName:      aws.String("mykey"),
 
 				LaunchTemplate: &ec2.LaunchTemplateSpecification{
-					LaunchTemplateId:   aws.String("lt-id"),
-					LaunchTemplateName: aws.String("lt-name"),
+					LaunchTemplateId: aws.String("lt-id"),
+					Version:          aws.String("v1"),
 				},
 
 				MaxCount: aws.Int64(1),
 				MinCount: aws.Int64(1),
 
+				NetworkInterfaces: []*ec2.InstanceNetworkInterfaceSpecification{
+					{
+						Groups:   []*string{aws.String("sg-123"), aws.String("sg-456")},
+						SubnetId: aws.String("subnet-123"),
+					},
+				},
+
 				Placement: &ec2.Placement{
 					Affinity: aws.String("foo"),
 				},
-
-				SecurityGroupIds: []*string{
-					aws.String("sg-123"),
-					aws.String("sg-456"),
-				},
-
-				SubnetId: aws.String("subnet-123"),
 
 				TagSpecifications: []*ec2.TagSpecification{{
 					ResourceType: aws.String("instance"),
 					Tags: []*ec2.Tag{
 						{
-							Key:   aws.String("LaunchConfigurationName"),
-							Value: aws.String("myLC"),
+							Key:   aws.String("LaunchTemplateID"),
+							Value: aws.String("lt-id"),
+						},
+						{
+							Key:   aws.String("LaunchTemplateVersion"),
+							Value: aws.String("v1"),
 						},
 						{
 							Key:   aws.String("launched-by-autospotting"),
@@ -1604,17 +1803,16 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 					name: "mygroup",
 					Group: &autoscaling.Group{
 						LaunchConfigurationName: aws.String("myLC"),
-						LaunchTemplate: &autoscaling.LaunchTemplateSpecification{
-							LaunchTemplateId:   aws.String("lt-id"),
-							LaunchTemplateName: aws.String("lt-name"),
-						},
 					},
 					launchConfiguration: &launchConfiguration{
 						LaunchConfiguration: &autoscaling.LaunchConfiguration{
+							AssociatePublicIpAddress: nil,
 							BlockDeviceMappings:      nil,
+							ImageId:                  aws.String("ami-123"),
+							KeyName:                  aws.String("mykey"),
 							InstanceMonitoring:       nil,
 							UserData:                 aws.String("userdata"),
-							AssociatePublicIpAddress: nil,
+							IamInstanceProfile:       aws.String("profile"),
 						},
 					},
 				},
@@ -1625,9 +1823,7 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 						Arn: aws.String("profile-arn"),
 					},
 
-					ImageId:      aws.String("ami-123"),
 					InstanceType: aws.String("t2.medium"),
-					KeyName:      aws.String("mykey"),
 
 					Placement: &ec2.Placement{
 						Affinity: aws.String("foo"),
@@ -1655,7 +1851,7 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 				EbsOptimized: aws.Bool(true),
 
 				IamInstanceProfile: &ec2.IamInstanceProfileSpecification{
-					Arn: aws.String("profile-arn"),
+					Name: aws.String("profile"),
 				},
 
 				ImageId: aws.String("ami-123"),
@@ -1669,11 +1865,6 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 
 				InstanceType: aws.String("t2.small"),
 				KeyName:      aws.String("mykey"),
-
-				LaunchTemplate: &ec2.LaunchTemplateSpecification{
-					LaunchTemplateId:   aws.String("lt-id"),
-					LaunchTemplateName: aws.String("lt-name"),
-				},
 
 				MaxCount: aws.Int64(1),
 				MinCount: aws.Int64(1),
@@ -1718,17 +1909,15 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 					name: "mygroup",
 					Group: &autoscaling.Group{
 						LaunchConfigurationName: aws.String("myLC"),
-						LaunchTemplate: &autoscaling.LaunchTemplateSpecification{
-							LaunchTemplateId:   aws.String("lt-id"),
-							LaunchTemplateName: aws.String("lt-name"),
-						},
 					},
 					launchConfiguration: &launchConfiguration{
 						LaunchConfiguration: &autoscaling.LaunchConfiguration{
+							IamInstanceProfile: aws.String("profile-name"),
+							ImageId:            aws.String("ami-123"),
 							InstanceMonitoring: &autoscaling.InstanceMonitoring{
 								Enabled: aws.Bool(true),
 							},
-
+							KeyName: aws.String("current-key"),
 							BlockDeviceMappings: []*autoscaling.BlockDeviceMapping{
 								{
 									DeviceName: aws.String("foo"),
@@ -1746,9 +1935,8 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 						Arn: aws.String("profile-arn"),
 					},
 
-					ImageId:      aws.String("ami-123"),
 					InstanceType: aws.String("t2.medium"),
-					KeyName:      aws.String("mykey"),
+					KeyName:      aws.String("older-key"),
 
 					Placement: &ec2.Placement{
 						Affinity: aws.String("foo"),
@@ -1781,7 +1969,7 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 				EbsOptimized: aws.Bool(true),
 
 				IamInstanceProfile: &ec2.IamInstanceProfileSpecification{
-					Arn: aws.String("profile-arn"),
+					Name: aws.String("profile-name"),
 				},
 
 				ImageId: aws.String("ami-123"),
@@ -1794,12 +1982,7 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 				},
 
 				InstanceType: aws.String("t2.small"),
-				KeyName:      aws.String("mykey"),
-
-				LaunchTemplate: &ec2.LaunchTemplateSpecification{
-					LaunchTemplateId:   aws.String("lt-id"),
-					LaunchTemplateName: aws.String("lt-name"),
-				},
+				KeyName:      aws.String("current-key"),
 
 				MaxCount: aws.Int64(1),
 				MinCount: aws.Int64(1),
@@ -1845,11 +2028,150 @@ func Test_instance_createRunInstancesInput(t *testing.T) {
 				UserData: aws.String("userdata"),
 			},
 		},
+		{
+			name: "create run instances input with customized UserData for Beanstalk",
+			inst: instance{
+				asg: &autoScalingGroup{
+					name: "mygroup",
+					Group: &autoscaling.Group{
+						LaunchConfigurationName: aws.String("myLC"),
+					},
+					launchConfiguration: &launchConfiguration{
+						LaunchConfiguration: &autoscaling.LaunchConfiguration{
+							IamInstanceProfile: aws.String("profile-name"),
+							ImageId:            aws.String("ami-123"),
+							InstanceMonitoring: &autoscaling.InstanceMonitoring{
+								Enabled: aws.Bool(true),
+							},
+							KeyName: aws.String("current-key"),
+							BlockDeviceMappings: []*autoscaling.BlockDeviceMapping{
+								{
+									DeviceName: aws.String("foo"),
+								},
+							},
+							AssociatePublicIpAddress: aws.Bool(true),
+							UserData:                 aws.String(string(beanstalkUserDataExample)),
+						},
+					},
+					config: AutoScalingConfig{
+						PatchBeanstalkUserdata: "true",
+					},
+				},
+				Instance: &ec2.Instance{
+					EbsOptimized: aws.Bool(true),
+
+					IamInstanceProfile: &ec2.IamInstanceProfile{
+						Arn: aws.String("profile-arn"),
+					},
+
+					InstanceType: aws.String("t2.medium"),
+					KeyName:      aws.String("older-key"),
+
+					Placement: &ec2.Placement{
+						Affinity: aws.String("foo"),
+					},
+
+					SecurityGroups: []*ec2.GroupIdentifier{
+						{
+							GroupName: aws.String("foo"),
+							GroupId:   aws.String("sg-123"),
+						},
+						{
+							GroupName: aws.String("bar"),
+							GroupId:   aws.String("sg-456"),
+						},
+					},
+
+					SubnetId: aws.String("subnet-123"),
+				},
+			}, args: args{
+				instanceType: "t2.small",
+				price:        1.5,
+			},
+			want: &ec2.RunInstancesInput{
+				BlockDeviceMappings: []*ec2.BlockDeviceMapping{
+					{
+						DeviceName: aws.String("foo"),
+					},
+				},
+
+				EbsOptimized: aws.Bool(true),
+
+				IamInstanceProfile: &ec2.IamInstanceProfileSpecification{
+					Name: aws.String("profile-name"),
+				},
+
+				ImageId: aws.String("ami-123"),
+
+				InstanceMarketOptions: &ec2.InstanceMarketOptionsRequest{
+					MarketType: aws.String("spot"),
+					SpotOptions: &ec2.SpotMarketOptions{
+						MaxPrice: aws.String("1.5"),
+					},
+				},
+
+				InstanceType: aws.String("t2.small"),
+				KeyName:      aws.String("current-key"),
+
+				MaxCount: aws.Int64(1),
+				MinCount: aws.Int64(1),
+
+				Monitoring: &ec2.RunInstancesMonitoringEnabled{
+					Enabled: aws.Bool(true),
+				},
+
+				Placement: &ec2.Placement{
+					Affinity: aws.String("foo"),
+				},
+
+				NetworkInterfaces: []*ec2.InstanceNetworkInterfaceSpecification{
+					{
+						AssociatePublicIpAddress: aws.Bool(true),
+						DeviceIndex:              aws.Int64(0),
+						SubnetId:                 aws.String("subnet-123"),
+						Groups: []*string{
+							aws.String("sg-123"),
+							aws.String("sg-456"),
+						},
+					},
+				},
+
+				TagSpecifications: []*ec2.TagSpecification{{
+					ResourceType: aws.String("instance"),
+					Tags: []*ec2.Tag{
+						{
+							Key:   aws.String("LaunchConfigurationName"),
+							Value: aws.String("myLC"),
+						},
+						{
+							Key:   aws.String("launched-by-autospotting"),
+							Value: aws.String("true"),
+						},
+						{
+							Key:   aws.String("launched-for-asg"),
+							Value: aws.String("mygroup"),
+						},
+					},
+				},
+				},
+				UserData: aws.String(base64.StdEncoding.EncodeToString(beanstalkUserDataWrappedExample)),
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 
-			if got := tt.inst.createRunInstancesInput(tt.args.instanceType, tt.args.price); !reflect.DeepEqual(got, tt.want) {
+			got := tt.inst.createRunInstancesInput(tt.args.instanceType, tt.args.price)
+
+			// make sure the lists of tags are sorted, otherwise the comparison fails
+			sort.Slice(got.TagSpecifications[0].Tags, func(i, j int) bool {
+				return *got.TagSpecifications[0].Tags[i].Key < *got.TagSpecifications[0].Tags[j].Key
+			})
+			sort.Slice(tt.want.TagSpecifications[0].Tags, func(i, j int) bool {
+				return *tt.want.TagSpecifications[0].Tags[i].Key < *tt.want.TagSpecifications[0].Tags[j].Key
+			})
+
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("instance.createRunInstancesInput() = %v, want %v", got, tt.want)
 			}
 		})
@@ -1930,6 +2252,167 @@ func Test_instance_isReadyToAttach(t *testing.T) {
 
 			if got := tt.instance.isReadyToAttach(tt.asg); got != tt.want {
 				t.Errorf("instance.isReadyToAttach() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_instance_isSameArch(t *testing.T) {
+
+	tests := []struct {
+		name          string
+		instance      instance
+		spotCandidate instanceTypeInformation
+		want          bool
+	}{
+		{
+			name: "Same architecture: both Intel",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "Intel",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "Intel",
+			},
+			want: true,
+		},
+
+		{
+			name: "Same architecture: both AMD",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "AMD",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "AMD",
+			},
+			want: true,
+		},
+
+		{
+			name: "Same architecture: Intel and AMD",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "Intel",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "AMD",
+			},
+			want: true,
+		},
+
+		{
+			name: "Same architecture: AMD and Intel",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "AMD",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "Intel",
+			},
+			want: true,
+		},
+
+		{
+			name: "Same architecture: Intel and Variable",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "Intel",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "Variable",
+			},
+			want: true,
+		},
+
+		{
+			name: "Same architecture: Variable and Intel",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "Variable",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "Intel",
+			},
+			want: true,
+		},
+
+		{
+			name: "Same architecture, both ARM-based",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "AWS",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "AWS",
+			},
+			want: true,
+		},
+
+		{
+			name: "Different architecture, Intel and ARM",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "Intel",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "AWS",
+			},
+			want: false,
+		},
+
+		{
+			name: "Different architecture, AMD and ARM",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "Intel",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "AWS",
+			},
+			want: false,
+		},
+
+		{
+			name: "Different architecture, ARM and Intel",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "AWS",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "Intel",
+			},
+			want: false,
+		},
+
+		{
+			name: "Different architecture, ARM and AMD",
+			instance: instance{
+				typeInfo: instanceTypeInformation{
+					PhysicalProcessor: "AWS",
+				},
+			},
+			spotCandidate: instanceTypeInformation{
+				PhysicalProcessor: "AMD",
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.instance.isSameArch(tt.spotCandidate); got != tt.want {
+				t.Errorf("instance.isSameArch() = %v, want %v", got, tt.want)
 			}
 		})
 	}

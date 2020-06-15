@@ -17,7 +17,7 @@ LambdaFunctionTagValue: autospotting
 # the Python shim for Go before AWS released official Go support for Lambda.
 # Because Lambda caches the code based on the path, you likely also need to
 # update the LambdaZipPath to explicitly pick up a more recent build.
-LambdaHandlerFunction: autospotting
+LambdaHandlerFunction: AutoSpotting
 
 # You may need to change this on large installations if you run into out of
 # memory situations.
@@ -27,10 +27,9 @@ LambdaMemorySize: '1024'
 # created in advance. Because of Lambda restrictions, the stack and the S3
 # bucket have to be located in the same region.
 LambdaS3Bucket: cloudprowess
-LambdaZipPath: nightly/lambda.zip
 
 # Default value: 0
-MinOnDemandNumber: '1'
+MinOnDemandNumber: '0'
 
 # Valid choices:
 # - for EC2 Classic environments: Linux/UNIX | SUSE Linux | Windows

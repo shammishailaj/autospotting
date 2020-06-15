@@ -1,3 +1,6 @@
+// Copyright (c) 2016-2019 Cristian Măgherușan-Stanciu
+// Licensed under the Open Software License version 3.0
+
 package autospotting
 
 import (
@@ -7,8 +10,9 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
+	"github.com/aws/aws-sdk-go/service/cloudformation"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/cristim/ec2-instances-info"
+	ec2instancesinfo "github.com/cristim/ec2-instances-info"
 	"github.com/davecgh/go-spew/spew"
 )
 
@@ -184,17 +188,20 @@ func TestOnDemandPriceMultiplier(t *testing.T) {
 					},
 				},
 			},
-			OnDemandPriceMultiplier: tt.multiplier,
+			AutoScalingConfig: AutoScalingConfig{
+				OnDemandPriceMultiplier: tt.multiplier,
+			},
 		}
 		r := region{
 			name: "us-east-1",
 			conf: cfg,
 			services: connections{
 				ec2: mockEC2{
-					dspho: &ec2.DescribeSpotPriceHistoryOutput{
-						SpotPriceHistory: []*ec2.SpotPrice{},
+					dsphpo: []*ec2.DescribeSpotPriceHistoryOutput{
+						{
+							SpotPriceHistory: []*ec2.SpotPrice{},
+						},
 					},
-					dspherr: nil,
 				},
 			}}
 		r.determineInstanceTypeInformation(cfg)
@@ -258,6 +265,9 @@ func TestDefaultASGFiltering(t *testing.T) {
 func TestFilterAsgs(t *testing.T) {
 	// Test invalid regular expression
 	var nullSlice []string
+	stackName := "dummyStackName"
+	stackStatus := "UPDATE_COMPLETE"
+
 	tests := []struct {
 		name    string
 		want    []string
@@ -548,7 +558,7 @@ func TestFilterAsgs(t *testing.T) {
 			want: []string{"asg2", "asg4"},
 		},
 		{
-			name: "Test  filters with invalid glob expression",
+			name: "Test filters with invalid glob expression",
 			tregion: &region{
 				tagsToFilterASGsBy: []Tag{
 					{Key: "spot-enabled", Value: "true"},
@@ -581,10 +591,51 @@ func TestFilterAsgs(t *testing.T) {
 			},
 			want: nullSlice,
 		},
+		{
+			name: "Test skipping execution against mixed groups",
+			want: []string{"asg1"},
+			tregion: &region{
+				tagsToFilterASGsBy: []Tag{{Key: "spot-enabled", Value: "true"}},
+				conf:               &Config{},
+				services: connections{
+					autoScaling: mockASG{
+						dasgo: &autoscaling.DescribeAutoScalingGroupsOutput{
+							AutoScalingGroups: []*autoscaling.Group{
+								{
+									Tags: []*autoscaling.TagDescription{
+										{Key: aws.String("environment"), Value: aws.String("dev"), ResourceId: aws.String("asg1")},
+										{Key: aws.String("spot-enabled"), Value: aws.String("true"), ResourceId: aws.String("asg1")},
+									},
+									AutoScalingGroupName: aws.String("asg1"),
+								},
+								{
+									MixedInstancesPolicy: &autoscaling.MixedInstancesPolicy{},
+									Tags: []*autoscaling.TagDescription{
+										{Key: aws.String("environment"), Value: aws.String("dev"), ResourceId: aws.String("asg2")},
+										{Key: aws.String("spot-enabled"), Value: aws.String("true"), ResourceId: aws.String("asg2")},
+									},
+									AutoScalingGroupName: aws.String("asg2"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := tt.tregion
+			r.services.cloudFormation = mockCloudFormation{
+				dso: &cloudformation.DescribeStacksOutput{
+					Stacks: []*cloudformation.Stack{
+						{
+							StackName:   &stackName,
+							StackStatus: &stackStatus,
+						},
+					},
+				},
+			}
 			r.scanForEnabledAutoScalingGroups()
 			var asgNames []string
 			for _, name := range r.enabledASGs {
@@ -592,6 +643,60 @@ func TestFilterAsgs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(tt.want, asgNames) {
 				t.Errorf("region.scanForEnabledAutoScalingGroups() = %v, want %v", asgNames, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsStackUpdating(t *testing.T) {
+	stackName := "dummyStackName"
+
+	tests := []struct {
+		name   string
+		region *region
+		want   bool
+	}{
+		{
+			name: "Stack is not updating",
+			region: &region{
+				services: connections{
+					cloudFormation: mockCloudFormation{
+						dso: &cloudformation.DescribeStacksOutput{
+							Stacks: []*cloudformation.Stack{
+								{
+									StackName:   &stackName,
+									StackStatus: aws.String("UPDATE_COMPLETE"),
+								},
+							},
+						},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "Stack is updating",
+			region: &region{
+				services: connections{
+					cloudFormation: mockCloudFormation{
+						dso: &cloudformation.DescribeStacksOutput{
+							Stacks: []*cloudformation.Stack{
+								{
+									StackName:   &stackName,
+									StackStatus: aws.String("UPDATE_IN_PROGRESS"),
+								},
+							},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, got := tt.region.isStackUpdating(&stackName); got != tt.want {
+				t.Errorf("Error in isStackUpdating: expected %v actual %v", tt.want, got)
 			}
 		})
 	}
@@ -609,7 +714,11 @@ func Test_region_scanInstances(t *testing.T) {
 			name: "region with a single instance",
 			regionInfo: &region{
 				name: "us-east-1",
-				conf: &Config{MinOnDemandNumber: 2},
+				conf: &Config{
+					AutoScalingConfig: AutoScalingConfig{
+						MinOnDemandNumber: 2,
+					},
+				},
 				services: connections{
 					ec2: mockEC2{
 						diperr: nil,

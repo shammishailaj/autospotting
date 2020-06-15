@@ -1,3 +1,6 @@
+// Copyright (c) 2016-2019 Cristian Măgherușan-Stanciu
+// Licensed under the Open Software License version 3.0
+
 package autospotting
 
 import (
@@ -14,6 +17,9 @@ import (
 )
 
 var logger, debug *log.Logger
+
+var hourlySavings float64
+var savingsMutex = &sync.RWMutex{}
 
 // Run starts processing all AWS regions looking for AutoScaling groups
 // enabled and taking action by replacing more pricy on-demand instances with
@@ -60,10 +66,6 @@ func addDefaultFilter(cfg *Config) {
 			cfg.FilterByTags = "spot-enabled=true"
 		}
 	}
-}
-
-func disableLogging() {
-	setupLogging(&Config{LogFile: ioutil.Discard})
 }
 
 func setupLogging(cfg *Config) {

@@ -1,3 +1,6 @@
+// Copyright (c) 2016-2019 Cristian Măgherușan-Stanciu
+// Licensed under the Open Software License version 3.0
+
 package autospotting
 
 import (
@@ -9,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
+	"github.com/aws/aws-sdk-go/service/cloudformation"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/davecgh/go-spew/spew"
 )
@@ -41,6 +45,7 @@ type prices struct {
 	onDemand     float64
 	spot         spotPriceMap
 	ebsSurcharge float64
+	premium      float64
 }
 
 // The key in this map is the availavility zone
@@ -137,7 +142,7 @@ func splitTagAndValue(value string) *Tag {
 }
 
 func (r *region) processDescribeInstancesPage(page *ec2.DescribeInstancesOutput, lastPage bool) bool {
-	logger.Println("Processing page of DescribeInstancesPages for", r.name)
+	debug.Println("Processing page of DescribeInstancesPages for", r.name)
 	debug.Println(page)
 
 	if len(page.Reservations) > 0 &&
@@ -205,6 +210,7 @@ func (r *region) determineInstanceTypeInformation(cfg *Config) {
 		price.onDemand = it.Pricing[r.name].Linux.OnDemand * cfg.OnDemandPriceMultiplier
 		price.spot = make(spotPriceMap)
 		price.ebsSurcharge = it.Pricing[r.name].EBSSurcharge
+		price.premium = r.conf.SpotProductPremium
 
 		// if at this point the instance price is still zero, then that
 		// particular instance type doesn't even exist in the current
@@ -215,11 +221,13 @@ func (r *region) determineInstanceTypeInformation(cfg *Config) {
 			info = instanceTypeInformation{
 				instanceType:        it.InstanceType,
 				vCPU:                it.VCPU,
+				PhysicalProcessor:   it.PhysicalProcessor,
 				memory:              it.Memory,
 				GPU:                 it.GPU,
 				pricing:             price,
 				virtualizationTypes: it.LinuxVirtualizationTypes,
 				hasEBSOptimization:  it.EBSOptimized,
+				EBSThroughput:       it.EBSThroughput,
 			}
 
 			if it.Storage != nil {
@@ -265,13 +273,13 @@ func (r *region) requestSpotPrices() error {
 		// spot market
 		price, err := strconv.ParseFloat(*priceInfo.SpotPrice, 64)
 		if err != nil {
-			logger.Println(r.name, "Instance type ", instType,
+			debug.Println(r.name, "Instance type ", instType,
 				"is not available on the spot market")
 			continue
 		}
 
 		if r.instanceTypeInformation[instType].pricing.spot == nil {
-			logger.Println(r.name, "Instance data missing for", instType, "in", az,
+			debug.Println(r.name, "Instance data missing for", instType, "in", az,
 				"skipping because this region is currently not supported")
 			continue
 		}
@@ -316,23 +324,74 @@ func isASGWithMatchingTags(asg *autoscaling.Group, tagsToMatch []Tag) bool {
 	return matchedTags == len(tagsToMatch)
 }
 
+func getTagValueFromASGWithMatchingTag(asg *autoscaling.Group, tagToMatch Tag) *string {
+	for _, asgTag := range asg.Tags {
+		if tagsMatch(asgTag, tagToMatch) {
+			return asgTag.Value
+		}
+	}
+	return nil
+}
+
+func (r *region) isStackUpdating(stackName *string) (string, bool) {
+	stackCompleteStatuses := map[string]struct{}{
+		"CREATE_COMPLETE":          {},
+		"UPDATE_COMPLETE":          {},
+		"UPDATE_ROLLBACK_COMPLETE": {},
+	}
+
+	svc := r.services.cloudFormation
+	input := cloudformation.DescribeStacksInput{
+		StackName: stackName,
+	}
+
+	if output, err := svc.DescribeStacks(&input); err != nil {
+		logger.Println("Failed to describe stack", *stackName, "with error:", err.Error())
+	} else {
+		stackStatus := output.Stacks[0].StackStatus
+		if _, exists := stackCompleteStatuses[*stackStatus]; exists == false {
+			return *stackStatus, true
+		}
+	}
+
+	return "", false
+}
+
 func (r *region) findMatchingASGsInPageOfResults(groups []*autoscaling.Group,
 	tagsToMatch []Tag) []autoScalingGroup {
 
 	var asgs []autoScalingGroup
 	var optInFilterMode = (r.conf.TagFilteringMode != "opt-out")
 
+	tagCloudFormationStackName := Tag{Key: "aws:cloudformation:stack-name", Value: "*"}
+
 	for _, group := range groups {
 		asgName := *group.AutoScalingGroupName
+
+		if group.MixedInstancesPolicy != nil {
+			debug.Printf("Skipping group %s because it's using a mixed instances policy",
+				asgName)
+			continue
+		}
+
 		groupMatchesExpectedTags := isASGWithMatchingTags(group, tagsToMatch)
 		// Go lacks a logical XOR operator, this is the equivalent to that logical
 		// expression. The goal is to add the matching ASGs when running in opt-in
 		// mode and the other way round.
 		if optInFilterMode != groupMatchesExpectedTags {
-			logger.Printf("Skipping group %s because its tags, the currently "+
+			debug.Printf("Skipping group %s because its tags, the currently "+
 				"configured filtering mode (%s) and tag filters do not align\n",
 				asgName, r.conf.TagFilteringMode)
 			continue
+		}
+
+		if stackName := getTagValueFromASGWithMatchingTag(group, tagCloudFormationStackName); stackName != nil {
+			debug.Println("Stack: ", *stackName)
+			if status, updating := r.isStackUpdating(stackName); updating {
+				logger.Printf("Skipping group %s because stack %s is in state %s\n",
+					asgName, *stackName, status)
+				continue
+			}
 		}
 
 		logger.Printf("Enabling group %s for processing because its tags, the "+
@@ -356,7 +415,7 @@ func (r *region) scanForEnabledAutoScalingGroups() {
 		&autoscaling.DescribeAutoScalingGroupsInput{},
 		func(page *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
 			pageNum++
-			logger.Println("Processing page", pageNum, "of DescribeAutoScalingGroupsPages for", r.name)
+			debug.Println("Processing page", pageNum, "of DescribeAutoScalingGroupsPages for", r.name)
 			matchingAsgs := r.findMatchingASGsInPageOfResults(page.AutoScalingGroups, r.tagsToFilterASGsBy)
 			r.enabledASGs = append(r.enabledASGs, matchingAsgs...)
 			return true
@@ -377,7 +436,10 @@ func (r *region) hasEnabledAutoScalingGroups() bool {
 
 func (r *region) processEnabledAutoScalingGroups() {
 	for _, asg := range r.enabledASGs {
-		asg.terminationMethod = r.conf.InstanceTerminationMethod
+
+		// Pass default configs to the group
+		asg.config = r.conf.AutoScalingConfig
+
 		r.wg.Add(1)
 		go func(a autoScalingGroup) {
 			a.process()

@@ -1,72 +1,17 @@
+// Copyright (c) 2016-2019 Cristian Măgherușan-Stanciu
+// Licensed under the Open Software License version 3.0
+
 package autospotting
 
 import (
 	"errors"
-	"time"
-
-	"math"
-	"strconv"
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
-)
-
-const (
-	// The tag names below allow overriding global setting on a per-group level.
-	// They should follow the format below:
-	// "autospotting_${overridden_command_line_parameter_name}"
-
-	// For example the tag named "autospotting_min_on_demand_number" will override
-	// the command-line option named "min_on_demand_number", and so on.
-
-	// OnDemandPercentageTag is the name of a tag that can be defined on a
-	// per-group level for overriding maintained on-demand capacity given as a
-	// percentage of the group's running instances.
-	OnDemandPercentageTag = "autospotting_min_on_demand_percentage"
-
-	// OnDemandNumberLong is the name of a tag that can be defined on a
-	// per-group level for overriding maintained on-demand capacity given as an
-	// absolute number.
-	OnDemandNumberLong = "autospotting_min_on_demand_number"
-
-	// BiddingPolicyTag stores the bidding policy for the spot instance
-	BiddingPolicyTag = "autospotting_bidding_policy"
-
-	// SpotPriceBufferPercentageTag stores percentage value above the
-	// current spot price to place the bid
-	SpotPriceBufferPercentageTag = "autospotting_spot_price_buffer_percentage"
-
-	// AllowedInstanceTypesTag is the name of a tag that can indicate which
-	// instance types are allowed in the current group
-	AllowedInstanceTypesTag = "autospotting_allowed_instance_types"
-
-	// DisallowedInstanceTypesTag is the name of a tag that can indicate which
-	// instance types are not allowed in the current group
-	DisallowedInstanceTypesTag = "autospotting_disallowed_instance_types"
-
-	// Default constant values should be defined below:
-
-	// DefaultSpotProductDescription stores the default operating system
-	// to use when looking up spot price history in the market.
-	DefaultSpotProductDescription = "Linux/UNIX (Amazon VPC)"
-
-	// DefaultMinOnDemandValue stores the default on-demand capacity to be kept
-	// running in a group managed by autospotting.
-	DefaultMinOnDemandValue = 0
-
-	// DefaultSpotPriceBufferPercentage stores the default percentage value
-	// above the current spot price to place a bid
-	DefaultSpotPriceBufferPercentage = 10.0
-
-	// DefaultBiddingPolicy stores the default bidding policy for
-	// the spot bid on a per-group level
-	DefaultBiddingPolicy = "normal"
-
-	// DefaultInstanceTerminationMethod is the default value for the instance termination
-	// method configuration option
-	DefaultInstanceTerminationMethod = AutoScalingTerminationMethod
 )
 
 type autoScalingGroup struct {
@@ -77,194 +22,20 @@ type autoScalingGroup struct {
 	launchConfiguration *launchConfiguration
 	instances           instances
 	minOnDemand         int64
-
-	terminationMethod string
+	config              AutoScalingConfig
 }
 
-func (a *autoScalingGroup) loadPercentageOnDemand(tagValue *string) (int64, bool) {
-	percentage, err := strconv.ParseFloat(*tagValue, 64)
-	if err != nil {
-		logger.Printf("Error with ParseFloat: %s\n", err.Error())
-	} else if percentage == 0 {
-		logger.Printf("Loaded MinOnDemand value to %f from tag %s\n", percentage, OnDemandPercentageTag)
-		return int64(percentage), true
-	} else if percentage > 0 && percentage <= 100 {
-		instanceNumber := float64(a.instances.count())
-		onDemand := int64(math.Floor((instanceNumber * percentage / 100.0) + .5))
-		logger.Printf("Loaded MinOnDemand value to %d from tag %s\n", onDemand, OnDemandPercentageTag)
-		return onDemand, true
-	}
-
-	logger.Printf("Ignoring value out of range %f\n", percentage)
-
-	return DefaultMinOnDemandValue, false
-}
-
-func (a *autoScalingGroup) loadSpotPriceBufferPercentage(tagValue *string) (float64, bool) {
-	spotPriceBufferPercentage, err := strconv.ParseFloat(*tagValue, 64)
-
-	if err != nil {
-		logger.Printf("Error with ParseFloat: %s\n", err.Error())
-		return DefaultSpotPriceBufferPercentage, false
-	} else if spotPriceBufferPercentage <= 0 {
-		logger.Printf("Ignoring out of range value : %f\n", spotPriceBufferPercentage)
-		return DefaultSpotPriceBufferPercentage, false
-	}
-
-	logger.Printf("Loaded SpotPriceBufferPercentage value to %f from tag %s\n", spotPriceBufferPercentage, SpotPriceBufferPercentageTag)
-	return spotPriceBufferPercentage, true
-}
-
-func (a *autoScalingGroup) loadNumberOnDemand(tagValue *string) (int64, bool) {
-	onDemand, err := strconv.Atoi(*tagValue)
-	if err != nil {
-		logger.Printf("Error with Atoi: %s\n", err.Error())
-	} else if onDemand >= 0 && int64(onDemand) <= *a.MaxSize {
-		logger.Printf("Loaded MinOnDemand value to %d from tag %s\n", onDemand, OnDemandNumberLong)
-		return int64(onDemand), true
-	} else {
-		logger.Printf("Ignoring value out of range %d\n", onDemand)
-	}
-	return DefaultMinOnDemandValue, false
-}
-
-func (a *autoScalingGroup) loadConfOnDemand() bool {
-	tagList := [2]string{OnDemandNumberLong, OnDemandPercentageTag}
-	loadDyn := map[string]func(*string) (int64, bool){
-		OnDemandPercentageTag: a.loadPercentageOnDemand,
-		OnDemandNumberLong:    a.loadNumberOnDemand,
-	}
-
-	for _, tagKey := range tagList {
-		if tagValue := a.getTagValue(tagKey); tagValue != nil {
-			if _, ok := loadDyn[tagKey]; ok {
-				if newValue, done := loadDyn[tagKey](tagValue); done {
-					a.minOnDemand = newValue
-					return done
-				}
-			}
-		}
-		debug.Println("Couldn't find tag", tagKey)
-	}
-	return false
-}
-
-func (a *autoScalingGroup) loadBiddingPolicy(tagValue *string) (string, bool) {
-	biddingPolicy := *tagValue
-	if biddingPolicy != "aggressive" {
-		return DefaultBiddingPolicy, false
-	}
-
-	logger.Printf("Loaded BiddingPolicy value with %s from tag %s\n", biddingPolicy, BiddingPolicyTag)
-	return biddingPolicy, true
-}
-
-func (a *autoScalingGroup) loadConfSpot() bool {
-	tagValue := a.getTagValue(BiddingPolicyTag)
-	if tagValue == nil {
-		debug.Println("Couldn't find tag", BiddingPolicyTag)
-		return false
-	}
-	if newValue, done := a.loadBiddingPolicy(tagValue); done {
-		a.region.conf.BiddingPolicy = newValue
-		logger.Println("BiddingPolicy =", a.region.conf.BiddingPolicy)
-		return done
-	}
-	return false
-}
-
-func (a *autoScalingGroup) loadConfSpotPrice() bool {
-
-	tagValue := a.getTagValue(SpotPriceBufferPercentageTag)
-	if tagValue == nil {
-		return false
-	}
-
-	newValue, done := a.loadSpotPriceBufferPercentage(tagValue)
-	if !done {
-		debug.Println("Couldn't find tag", SpotPriceBufferPercentageTag)
-		return false
-	}
-
-	a.region.conf.SpotPriceBufferPercentage = newValue
-	return done
-}
-
-// Add configuration of other elements here: prices, whitelisting, etc
-func (a *autoScalingGroup) loadConfigFromTags() bool {
-
-	resOnDemandConf := a.loadConfOnDemand()
-
-	resSpotConf := a.loadConfSpot()
-
-	resSpotPriceConf := a.loadConfSpotPrice()
-
-	if resOnDemandConf {
-		logger.Println("Found and applied configuration for OnDemand value")
-	}
-	if resSpotConf {
-		logger.Println("Found and applied configuration for Spot Bid")
-	}
-	if resSpotPriceConf {
-		logger.Println("Found and applied configuration for Spot Price")
-	}
-	if resOnDemandConf || resSpotConf || resSpotPriceConf {
-		return true
-	}
-	return false
-}
-
-func (a *autoScalingGroup) loadDefaultConfigNumber() (int64, bool) {
-	onDemand := a.region.conf.MinOnDemandNumber
-	if onDemand >= 0 && onDemand <= int64(a.instances.count()) {
-		logger.Printf("Loaded default value %d from conf number.", onDemand)
-		return onDemand, true
-	}
-	logger.Println("Ignoring default value out of range:", onDemand)
-	return DefaultMinOnDemandValue, false
-}
-
-func (a *autoScalingGroup) loadDefaultConfigPercentage() (int64, bool) {
-	percentage := a.region.conf.MinOnDemandPercentage
-	if percentage < 0 || percentage > 100 {
-		logger.Printf("Ignoring default value out of range: %f", percentage)
-		return DefaultMinOnDemandValue, false
-	}
-	instanceNumber := a.instances.count()
-	onDemand := int64(math.Floor((float64(instanceNumber) * percentage / 100.0) + .5))
-	logger.Printf("Loaded default value %d from conf percentage.", onDemand)
-	return onDemand, true
-}
-
-func (a *autoScalingGroup) loadDefaultConfig() bool {
-	done := false
-	a.minOnDemand = DefaultMinOnDemandValue
-
-	if a.region.conf.SpotPriceBufferPercentage <= 0 {
-		a.region.conf.SpotPriceBufferPercentage = DefaultSpotPriceBufferPercentage
-	}
-
-	if a.region.conf.MinOnDemandNumber != 0 {
-		a.minOnDemand, done = a.loadDefaultConfigNumber()
-	}
-	if !done && a.region.conf.MinOnDemandPercentage != 0 {
-		a.minOnDemand, done = a.loadDefaultConfigPercentage()
-	} else {
-		logger.Println("No default value for on-demand instances specified, skipping.")
-	}
-	return done
-}
-
-func (a *autoScalingGroup) loadLaunchConfiguration() error {
+func (a *autoScalingGroup) loadLaunchConfiguration() (*launchConfiguration, error) {
 	//already done
 	if a.launchConfiguration != nil {
-		return nil
+		return a.launchConfiguration, nil
 	}
 
 	lcName := a.LaunchConfigurationName
 
 	if lcName == nil {
-		return errors.New("missing launch configuration")
+		// ASG does not have launch configuration
+		return nil, nil
 	}
 
 	svc := a.region.services.autoScaling
@@ -276,17 +47,17 @@ func (a *autoScalingGroup) loadLaunchConfiguration() error {
 
 	if err != nil {
 		logger.Println(err.Error())
-		return err
+		return nil, err
 	}
 
 	a.launchConfiguration = &launchConfiguration{
 		LaunchConfiguration: resp.LaunchConfigurations[0],
 	}
-	return nil
+	return a.launchConfiguration, nil
 }
 
 func (a *autoScalingGroup) needReplaceOnDemandInstances() bool {
-	onDemandRunning, totalRunning := a.alreadyRunningInstanceCount(false, "")
+	onDemandRunning, totalRunning := a.alreadyRunningInstanceCount(false, nil)
 	if onDemandRunning > a.minOnDemand {
 		logger.Println("Currently more than enough OnDemand instances running")
 		return true
@@ -296,7 +67,7 @@ func (a *autoScalingGroup) needReplaceOnDemandInstances() bool {
 		return false
 	}
 	logger.Println("Currently fewer OnDemand instances than required !")
-	if a.allInstanceRunning() && a.instances.count64() >= *a.DesiredCapacity {
+	if a.allInstancesRunning() && a.instances.count64() >= *a.DesiredCapacity {
 		logger.Println("All instances are running and desired capacity is satisfied")
 		if randomSpot := a.getAnySpotInstance(); randomSpot != nil {
 			if totalRunning == 1 {
@@ -304,7 +75,7 @@ func (a *autoScalingGroup) needReplaceOnDemandInstances() bool {
 			} else {
 				logger.Println("Terminating a random spot instance",
 					*randomSpot.Instance.InstanceId)
-				switch a.terminationMethod {
+				switch a.config.TerminationMethod {
 				case DetachTerminationMethod:
 					randomSpot.terminate()
 				default:
@@ -316,9 +87,35 @@ func (a *autoScalingGroup) needReplaceOnDemandInstances() bool {
 	return false
 }
 
-func (a *autoScalingGroup) allInstanceRunning() bool {
-	_, totalRunning := a.alreadyRunningInstanceCount(false, "")
+func (a *autoScalingGroup) allInstancesRunning() bool {
+	_, totalRunning := a.alreadyRunningInstanceCount(false, nil)
 	return totalRunning == a.instances.count64()
+}
+
+func (a *autoScalingGroup) calculateHourlySavings() float64 {
+	var savings float64
+	for i := range a.instances.instances() {
+		savings += (i.typeInfo.pricing.onDemand + i.typeInfo.pricing.premium) - i.price
+	}
+	return savings
+}
+
+func (a *autoScalingGroup) licensedToRun() (bool, error) {
+	defer savingsMutex.Unlock()
+	savingsMutex.Lock()
+
+	savings := a.calculateHourlySavings()
+	hourlySavings += savings
+
+	monthlySavings := hourlySavings * 24 * 30
+	if (monthlySavings > 1000) &&
+		strings.Contains(a.region.conf.Version, "nightly") &&
+		a.region.conf.LicenseType == "evaluation" {
+		return false, fmt.Errorf(
+			"would reach estimated monthly savings of $%.2f when processing this group, above the $1000 evaluation limit",
+			monthlySavings)
+	}
+	return true, nil
 }
 
 func (a *autoScalingGroup) process() {
@@ -330,6 +127,15 @@ func (a *autoScalingGroup) process() {
 	logger.Println("Finding spot instances created for", a.name)
 
 	spotInstance := a.findUnattachedInstanceLaunchedForThisASG()
+	debug.Println("Candidate Spot instance", spotInstance)
+
+	shouldRun := cronRunAction(time.Now(), a.config.CronSchedule, a.config.CronTimezone, a.config.CronScheduleState)
+	debug.Println(a.region.name, a.name, "Should take replacement actions:", shouldRun)
+
+	if ok, err := a.licensedToRun(); !ok {
+		logger.Println(a.region.name, a.name, "Skipping group, license limit reached:", err.Error())
+		return
+	}
 
 	if spotInstance == nil {
 		logger.Println("No spot instances were found for ", a.name)
@@ -347,7 +153,16 @@ func (a *autoScalingGroup) process() {
 			return
 		}
 
-		a.loadLaunchConfiguration()
+		if !shouldRun {
+			logger.Println(a.region.name, a.name,
+				"Skipping run, outside the enabled cron run schedule")
+			return
+		}
+
+		if _, err := a.loadLaunchConfiguration(); err != nil {
+			logger.Printf("Could not launch configuration: %s", err)
+		}
+
 		err := onDemandInstance.launchSpotReplacement()
 		if err != nil {
 			logger.Printf("Could not launch cheapest spot instance: %s", err)
@@ -357,7 +172,13 @@ func (a *autoScalingGroup) process() {
 
 	spotInstanceID = *spotInstance.InstanceId
 
-	if !a.needReplaceOnDemandInstances() || !spotInstance.isReadyToAttach(a) {
+	if !a.needReplaceOnDemandInstances() || !shouldRun {
+		logger.Println("Spot instance", spotInstanceID, "is not need anymore by ASG",
+			a.name, "terminating the spot instance.")
+		spotInstance.terminate()
+		return
+	}
+	if !spotInstance.isReadyToAttach(a) {
 		logger.Println("Waiting for next run while processing", a.name)
 		return
 	}
@@ -391,7 +212,7 @@ func (a *autoScalingGroup) scanInstances() instances {
 		if i.isSpot() {
 			i.price = i.typeInfo.pricing.spot[*i.Placement.AvailabilityZone]
 		} else {
-			i.price = i.typeInfo.pricing.onDemand
+			i.price = i.typeInfo.pricing.onDemand + i.typeInfo.pricing.premium
 		}
 
 		a.instances.add(i)
@@ -401,16 +222,6 @@ func (a *autoScalingGroup) scanInstances() instances {
 
 func (a *autoScalingGroup) replaceOnDemandInstanceWithSpot(
 	spotInstanceID string) error {
-
-	minSize, maxSize := *a.MinSize, *a.MaxSize
-	desiredCapacity := *a.DesiredCapacity
-
-	// temporarily increase AutoScaling group in case it's of static size
-	if minSize == maxSize {
-		logger.Println(a.name, "Temporarily increasing MaxSize")
-		a.setAutoScalingMaxSize(maxSize + 1)
-		defer a.setAutoScalingMaxSize(maxSize)
-	}
 
 	// get the details of our spot instance so we can see its AZ
 	logger.Println(a.name, "Retrieving instance details for ", spotInstanceID)
@@ -434,19 +245,25 @@ func (a *autoScalingGroup) replaceOnDemandInstanceWithSpot(
 	}
 	logger.Println(a.name, "found on-demand instance", *odInst.InstanceId,
 		"replacing with new spot instance", *spotInst.InstanceId)
-	// revert attach/detach order when running on minimum capacity
-	if desiredCapacity == minSize {
-		attachErr := a.attachSpotInstance(spotInstanceID)
-		if attachErr != nil {
-			logger.Println(a.name, "skipping detaching on-demand due to failure to",
-				"attach the new spot instance", *spotInst.InstanceId)
-			return nil
-		}
-	} else {
-		defer a.attachSpotInstance(spotInstanceID)
+
+	desiredCapacity, maxSize := *a.DesiredCapacity, *a.MaxSize
+
+	// temporarily increase AutoScaling group in case the desired capacity reaches the max size,
+	// otherwise attachSpotInstance might fail
+	if desiredCapacity == maxSize {
+		logger.Println(a.name, "Temporarily increasing MaxSize")
+		a.setAutoScalingMaxSize(maxSize + 1)
+		defer a.setAutoScalingMaxSize(maxSize)
 	}
 
-	switch a.terminationMethod {
+	attachErr := a.attachSpotInstance(spotInstanceID)
+	if attachErr != nil {
+		logger.Println(a.name, "skipping detaching on-demand due to failure to",
+			"attach the new spot instance ", *spotInst.InstanceId)
+		return nil
+	}
+
+	switch a.config.TerminationMethod {
 	case DetachTerminationMethod:
 		return a.detachAndTerminateOnDemandInstance(odInst.InstanceId)
 	default:
@@ -477,9 +294,20 @@ func (a *autoScalingGroup) getInstance(
 				continue
 			}
 
-			if considerInstanceProtection && (i.isProtectedFromScaleIn() || i.isProtectedFromTermination()) {
-				debug.Println(a.name, "skipping protected instance", *i.InstanceId)
-				continue
+			if considerInstanceProtection {
+				protected := i.isProtectedFromScaleIn()
+				if !protected {
+					protectedT, err := i.isProtectedFromTermination()
+					if err != nil {
+						debug.Println(a.name, "failed to determine termination protection for", *i.InstanceId)
+					}
+					protected = protectedT
+				}
+
+				if protected {
+					debug.Println(a.name, "skipping protected instance", *i.InstanceId)
+					continue
+				}
 			}
 
 			if (availabilityZone != nil) && (*availabilityZone != *i.Placement.AvailabilityZone) {
@@ -675,7 +503,7 @@ func (a *autoScalingGroup) terminateInstanceInAutoScalingGroup(
 
 // Counts the number of already running instances on-demand or spot, in any or a specific AZ.
 func (a *autoScalingGroup) alreadyRunningInstanceCount(
-	spot bool, availabilityZone string) (int64, int64) {
+	spot bool, availabilityZone *string) (int64, int64) {
 
 	var total, count int64
 	instanceCategory := "spot"
@@ -688,11 +516,11 @@ func (a *autoScalingGroup) alreadyRunningInstanceCount(
 		if *inst.Instance.State.Name == "running" {
 			// Count running Spot instances
 			if spot && inst.isSpot() &&
-				(*inst.Placement.AvailabilityZone == availabilityZone || availabilityZone == "") {
+				(availabilityZone == nil || *inst.Placement.AvailabilityZone == *availabilityZone) {
 				count++
 				// Count running OnDemand instances
 			} else if !spot && !inst.isSpot() &&
-				(*inst.Placement.AvailabilityZone == availabilityZone || availabilityZone == "") {
+				(availabilityZone == nil || *inst.Placement.AvailabilityZone == *availabilityZone) {
 				count++
 			}
 			// Count total running instances
@@ -701,13 +529,4 @@ func (a *autoScalingGroup) alreadyRunningInstanceCount(
 	}
 	logger.Println(a.name, "Found", count, instanceCategory, "instances running on a total of", total)
 	return count, total
-}
-
-func (a *autoScalingGroup) getTagValue(keyMatch string) *string {
-	for _, asgTag := range a.Tags {
-		if *asgTag.Key == keyMatch {
-			return asgTag.Value
-		}
-	}
-	return nil
 }

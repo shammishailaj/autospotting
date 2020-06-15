@@ -1,14 +1,14 @@
 DEPS := "wget git go docker golint zip"
 
-BINARY := autospotting
-BINARY_PKG := ./core
-GOFILES := $(shell find . -type f -name '*.go' -not -path "./vendor/*")
+BINARY := AutoSpotting
+
 COVER_PROFILE := /tmp/coverage.out
 BUCKET_NAME ?= cloudprowess
 FLAVOR ?= custom
 LOCAL_PATH := build/s3/$(FLAVOR)
-LICENSE_FILES := LICENSE
-TERRAFORM := docker container run --rm -e AWS_DEFAULT_REGION=us-east-1 -v $(shell pwd):$(shell pwd) -w $(shell pwd) hashicorp/terraform
+LICENSE_FILES := LICENSE THIRDPARTY
+GOOS ?= linux
+GOARCH ?= amd64
 
 SHA := $(shell git rev-parse HEAD | cut -c 1-7)
 BUILD := $(or $(TRAVIS_BUILD_NUMBER), $(TRAVIS_BUILD_NUMBER), $(SHA))
@@ -25,7 +25,6 @@ all: fmt-check vet-check build test                          ## Build the code
 clean:                                                       ## Remove installed packages/temporary files
 	go clean ./...
 	rm -rf $(BINDATA_DIR) $(LOCAL_PATH)
-	rm -rf .terraform
 .PHONY: clean
 
 check_deps:                                                  ## Verify the system has all dependencies installed
@@ -35,29 +34,34 @@ check_deps:                                                  ## Verify the syste
 	@echo "all dependencies satisifed: $(DEPS)"
 .PHONY: check_deps
 
-build_deps:
-	@go get -u github.com/mattn/goveralls
-	@go get -u golang.org/x/lint/golint
-	@go get -u golang.org/x/tools/cmd/cover
+build_deps:                                                  ## Install all dependencies specified in tools.go
+	@grep _ tools.go | cut -d '"' -f 2 | xargs go install
 .PHONY: build_deps
 
-update_deps:												 ## Update all dependencies
-	@dep ensure -update
+update_deps:                                                 ## Update all dependencies
+	@go get -u
+	@go mod tidy
 .PHONY: update_deps
 
-build: build_deps                                            ## Build autospotting binary
-	GOOS=linux go build -ldflags=$(LDFLAGS) -o $(BINARY)
+build:                                                       ## Build the AutoSpotting binary
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags=$(LDFLAGS) -o $(BINARY)
 .PHONY: build
 
 archive: build                                               ## Create archive to be uploaded
 	@rm -rf $(LOCAL_PATH)
 	@mkdir -p $(LOCAL_PATH)
 	@zip $(LOCAL_PATH)/lambda.zip $(BINARY) $(LICENSE_FILES)
-	@cp -f cloudformation/stacks/AutoSpotting/template.yaml $(LOCAL_PATH)/template.yaml
+	@cp -f cloudformation/stacks/AutoSpotting/template.yaml $(LOCAL_PATH)/
 	@cp -f cloudformation/stacks/AutoSpotting/template.yaml $(LOCAL_PATH)/template_build_$(BUILD).yaml
-	@sed -i "s#lambda\.zip#lambda_build_$(BUILD).zip#" $(LOCAL_PATH)/template_build_$(BUILD).yaml
+	@zip -j $(LOCAL_PATH)/regional_stack_lambda.zip cloudformation/stacks/AutoSpotting/regional_stack_lambda.py
+	@cp -f cloudformation/stacks/AutoSpotting/regional_template.yaml $(LOCAL_PATH)/
+	@sed -e "s#lambda\.zip#lambda_build_$(BUILD).zip#" $(LOCAL_PATH)/template_build_$(BUILD).yaml > $(LOCAL_PATH)/template_build_$(BUILD).yaml.new
+	@mv -- $(LOCAL_PATH)/template_build_$(BUILD).yaml.new $(LOCAL_PATH)/template_build_$(BUILD).yaml
 	@cp -f $(LOCAL_PATH)/lambda.zip $(LOCAL_PATH)/lambda_build_$(BUILD).zip
 	@cp -f $(LOCAL_PATH)/lambda.zip $(LOCAL_PATH)/lambda_build_$(SHA).zip
+	@cp -f $(LOCAL_PATH)/regional_stack_lambda.zip $(LOCAL_PATH)/regional_stack_lambda_build_$(BUILD).zip
+	@cp -f $(LOCAL_PATH)/regional_stack_lambda.zip $(LOCAL_PATH)/regional_stack_lambda_build_$(SHA).zip
+
 .PHONY: archive
 
 upload: archive                                              ## Upload binary
@@ -65,31 +69,24 @@ upload: archive                                              ## Upload binary
 .PHONY: upload
 
 vet-check:                                                   ## Verify vet compliance
-ifeq ($(shell go tool vet -all -shadow=true $(GOFILES) 2>&1 | wc -l | tr -d '[:space:]'), 0)
-	@printf "ok\tall files passed go vet\n"
-else
-	@printf "error\tsome files did not pass go vet\n"
-	@go tool vet -all -shadow=true $(GOFILES) 2>&1
-endif
+	@go vet -all ./...
 .PHONY: vet-check
 
 fmt-check:                                                   ## Verify fmt compliance
-ifeq ($(shell gofmt -l -s $(GOFILES) | wc -l | tr -d '[:space:]'), 0)
-	@printf "ok\tall files passed go fmt\n"
-else
-	@printf "error\tsome files did not pass go fmt, fix the following formatting diff:\n"
-	@gofmt -l -s -d $(GOFILES)
-	@exit 1
-endif
+	@sh -c 'test -z "$$(gofmt -l -s -d . | tee /dev/stderr)"'
 .PHONY: fmt-check
 
+module-check: build_deps                                     ## Verify that all changes to go.mod and go.sum are checked in, and fail otherwise
+	@go mod tidy -v
+	git diff --exit-code HEAD -- go.mod go.sum
+.PHONY: module-check
+
 test:                                                        ## Test go code and coverage
-	@go test -covermode=count -coverprofile=$(COVER_PROFILE) $(BINARY_PKG)
+	@go test -covermode=count -coverprofile=$(COVER_PROFILE) ./...
 .PHONY: test
 
-lint:
-	@golint -set_exit_status $(BINARY_PKG)
-	@golint -set_exit_status .
+lint: build_deps
+	@golint -set_exit_status ./...
 .PHONY: lint
 
 full-test: fmt-check vet-check test lint                     ## Pass test / fmt / vet / lint
@@ -99,21 +96,21 @@ html-cover: test                                             ## Display coverage
 	@go tool cover -html=$(COVER_PROFILE)
 .PHONY: html-cover
 
-travisci-cover: html-cover                                   ## Test & generate coverage in the TravisCI format, fails unless executed from TravisCI
-	@goveralls -coverprofile=$(COVER_PROFILE) -service=travis-ci
-.PHONY: travisci-cover
+ci-cover: html-cover                                         ## Test & generate coverage in the TravisCI format, fails unless executed from TravisCI
+ifdef COVERALLS_TOKEN
+	@goveralls -coverprofile=$(COVER_PROFILE) -service=travis-ci -repotoken=$(COVERALLS_TOKEN)
+endif
+.PHONY: ci-cover
 
-travisci-checks: fmt-check vet-check lint                    ## Pass fmt / vet & lint format
-.PHONY: travisci-checks
+ci-checks: fmt-check vet-check module-check lint             ## Pass fmt / vet & lint format
+.PHONY: ci-checks
 
-travisci: archive travisci-checks travisci-cover             ## Executed by TravisCI
-.PHONY: travisci
+ci: archive ci-checks ci-cover                               ## Executes inside the CI Docker builder
+.PHONY: ci
 
-terraform-test: archive                                      ## Test the Terraform code
-	$(TERRAFORM) init terraform
-	$(TERRAFORM) validate -var lambda_zipname=$(LOCAL_PATH)/lambda.zip terraform/
-	$(TERRAFORM) validate -var lambda_s3_bucket=bucket -var lambda_s3_key=key terraform/
-.PHONY: terraform-test
+ci-docker:                                                   ## Executed by CI
+	@docker-compose up --build --abort-on-container-exit --exit-code-from autospotting
+.PHONY: ci-docker
 
 help:                                                        ## Show this help
 	@printf "Rules:\n"

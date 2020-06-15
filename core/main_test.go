@@ -1,13 +1,35 @@
+// Copyright (c) 2016-2019 Cristian Măgherușan-Stanciu
+// Licensed under the Open Software License version 3.0
+
 package autospotting
 
 import (
 	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"os"
 	"reflect"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 )
+
+func TestMain(m *testing.M) {
+	var logOutput io.Writer
+
+	if os.Getenv("AUTOSPOTTING_DEBUG") == "true" {
+		logOutput = os.Stdout
+	} else {
+		logOutput = ioutil.Discard
+	}
+
+	logger = log.New(logOutput, "", 0)
+	debug = log.New(logOutput, "", 0)
+
+	os.Exit(m.Run())
+}
 
 func Test_getRegions(t *testing.T) {
 

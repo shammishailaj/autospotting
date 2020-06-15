@@ -39,7 +39,7 @@ your CloudFormation or Terraform stack to use those new binaries.
 1. Run the following command to install the AutoSpotting project into your
    GOPATH directory:
 
-   `go get github.com/cristim/autospotting`
+   `go get github.com/AutoSpotting/AutoSpotting`
 
    This downloads the source from GitHub, pulls in all necessary dependencies,
    builds it for local execution and deploys the binary into the golang binary
@@ -47,7 +47,7 @@ your CloudFormation or Terraform stack to use those new binaries.
 
 1. Navigate to the root of the AutoSpotting repository:
 
-   `cd $GOPATH/src/github.com/cristim/autospotting`
+   `cd $GOPATH/src/github.com/AutoSpotting/AutoSpotting`
 
 1. (Optional) You may want to make a minor change to the source code so you can
    tell when the tool is running your own custom-built version. If so, add a
@@ -64,16 +64,19 @@ your CloudFormation or Terraform stack to use those new binaries.
 
 1. Build the code:
 
-   `make build` or `go build` should both work, the only difference is the
-   inclusion of versioning information into the binary, which may not matter
-   much anyway.
+   Run `make build` to generate a binary at `./AutoSpotting`. The resulting
+   binary is suitable for running on AWS Lambda. If you want a binary for
+   running locally and your local environment is not linux/amd64, try running
+   the following:
+
+   `GOOS=$(go env GOOS) GOARCH=$(go env GOARCH) make build`
 
 ## Running locally ##
 
 1. Run the code, assuming you have AWS credentials defined in your environment
    or in the default AWS credentials profile:
 
-   `./autospotting`
+   `./AutoSpotting`
 
    You may also pass some command line flags, see the --help for more
    information on the available options.
@@ -88,11 +91,14 @@ your CloudFormation or Terraform stack to use those new binaries.
 1. The build system can use a `BUCKET_NAME` variable that tells it where to
    upload new binaries. Set it into your environment to the name of your S3
    bucket.
-
    `export BUCKET_NAME=my-bucket`
 
 1. Define some AWS credentials or profile information into your
    [environment](http://docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html#cli-environment).
+
+1. (Optional) You can also create the lambda deployment package using the below
+   command, the zip file is generated in the `build` directory.
+   `make archive`
 
 1. Build and upload your binaries to the S3 bucket.
    `make upload`
@@ -155,10 +161,10 @@ to have defined some AWS credential environment variables.
 You can also invoke the container entrypoint directly using
     `docker-compose run autospotting`
 
-This also accepts all the autospotting command-line arguments, including `-help`
+This also accepts all the AutoSpotting command-line arguments, including `-help`
 which explains all the available options.
 
 Pre-built Docker images for the latest builds are also available on Dockerhub at
-[cristim/autospotting](https://hub.docker.com/r/cristim/autospotting/)
+[AutoSpotting/AutoSpotting](https://hub.docker.com/r/AutoSpotting/AutoSpotting/)
 
 [Back to the main Readme](./README.md)
